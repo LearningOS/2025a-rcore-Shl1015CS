@@ -86,6 +86,12 @@ impl FrameAllocator for StackFrameAllocator {
     }
 }
 
+impl StackFrameAllocator {
+    pub fn remain_page_count(&self) -> usize {
+        self.recycled.len() + (self.end - self.current)
+    }
+}
+
 type FrameAllocatorImpl = StackFrameAllocator;
 
 lazy_static! {

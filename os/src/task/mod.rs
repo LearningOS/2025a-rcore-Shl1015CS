@@ -15,8 +15,8 @@ mod switch;
 mod task;
 
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::{MapPermission, VirtAddr, VirtPageNum, PageTableEntry};
 use crate::sync::UPSafeCell;
-use crate::trap::TrapContext;
 use alloc::vec::Vec;
 use lazy_static::*;
 use switch::__switch;
@@ -40,8 +40,8 @@ pub struct TaskManager {
     inner: UPSafeCell<TaskManagerInner>,
 }
 
-/// The task manager inner in 'UPSafeCell'
-struct TaskManagerInner {
+/// Inner of Task Manager
+pub struct TaskManagerInner {
     /// task list
     tasks: Vec<TaskControlBlock>,
     /// id of current `Running` task
@@ -49,14 +49,15 @@ struct TaskManagerInner {
 }
 
 lazy_static! {
-    /// a `TaskManager` global instance through lazy_static!
+    /// Global variable: TASK_MANAGER
     pub static ref TASK_MANAGER: TaskManager = {
-        println!("init TASK_MANAGER");
         let num_app = get_num_app();
-        println!("num_app = {}", num_app);
         let mut tasks: Vec<TaskControlBlock> = Vec::new();
         for i in 0..num_app {
-            tasks.push(TaskControlBlock::new(get_app_data(i), i));
+            tasks.push(TaskControlBlock::new(
+                get_app_data(i),
+                i,
+            ));
         }
         TaskManager {
             num_app,
@@ -72,19 +73,18 @@ lazy_static! {
 
 impl TaskManager {
     /// Run the first task in task list.
-    ///
-    /// Generally, the first task in task list is an idle task (we call it zero process later).
-    /// But in ch4, we load apps statically, so the first task is a real app.
     fn run_first_task(&self) -> ! {
         let mut inner = self.inner.exclusive_access();
         let next_task = &mut inner.tasks[0];
         next_task.task_status = TaskStatus::Running;
+        let next_trap_cx = next_task.get_trap_cx();
+        next_trap_cx.kernel_sp = crate::mm::kernel_stack_position(0).1;
         let next_task_cx_ptr = &next_task.task_cx as *const TaskContext;
         drop(inner);
         let mut _unused = TaskContext::zero_init();
         // before this, we should drop local variables that must be dropped manually
         unsafe {
-            __switch(&mut _unused as *mut _, next_task_cx_ptr);
+            __switch(&mut _unused as *mut TaskContext, next_task_cx_ptr);
         }
         panic!("unreachable in run_first_task!");
     }
@@ -92,15 +92,15 @@ impl TaskManager {
     /// Change the status of current `Running` task into `Ready`.
     fn mark_current_suspended(&self) {
         let mut inner = self.inner.exclusive_access();
-        let cur = inner.current_task;
-        inner.tasks[cur].task_status = TaskStatus::Ready;
+        let current = inner.current_task;
+        inner.tasks[current].task_status = TaskStatus::Ready;
     }
 
     /// Change the status of current `Running` task into `Exited`.
     fn mark_current_exited(&self) {
         let mut inner = self.inner.exclusive_access();
-        let cur = inner.current_task;
-        inner.tasks[cur].task_status = TaskStatus::Exited;
+        let current = inner.current_task;
+        inner.tasks[current].task_status = TaskStatus::Exited;
     }
 
     /// Find next task to run and return task id.
@@ -112,25 +112,6 @@ impl TaskManager {
         (current + 1..current + self.num_app + 1)
             .map(|id| id % self.num_app)
             .find(|id| inner.tasks[*id].task_status == TaskStatus::Ready)
-    }
-
-    /// Get the current 'Running' task's token.
-    fn get_current_token(&self) -> usize {
-        let inner = self.inner.exclusive_access();
-        inner.tasks[inner.current_task].get_user_token()
-    }
-
-    /// Get the current 'Running' task's trap contexts.
-    fn get_current_trap_cx(&self) -> &'static mut TrapContext {
-        let inner = self.inner.exclusive_access();
-        inner.tasks[inner.current_task].get_trap_cx()
-    }
-
-    /// Change the current 'Running' task's program break
-    pub fn change_current_program_brk(&self, size: i32) -> Option<usize> {
-        let mut inner = self.inner.exclusive_access();
-        let cur = inner.current_task;
-        inner.tasks[cur].change_program_brk(size)
     }
 
     /// Switch current `Running` task to the task we have found,
@@ -152,6 +133,73 @@ impl TaskManager {
         } else {
             panic!("All applications completed!");
         }
+    }
+
+    /// get the current user token
+    fn get_current_token(&self) -> usize {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].get_user_token()
+    }
+
+    /// get the current trap context
+    fn get_current_trap_cx(&self) -> &'static mut crate::trap::TrapContext {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].get_trap_cx()
+    }
+
+    /// Get the syscall times of current task
+    fn get_current_syscall_times(&self, syscall_id: usize) -> u32 {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        if syscall_id < crate::config::MAX_SYSCALL_NUM {
+            inner.tasks[current].syscall_times[syscall_id]
+        } else {
+            0
+        }
+    }
+
+    /// Increase the syscall times of current task
+    fn increase_syscall_times(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        if syscall_id < crate::config::MAX_SYSCALL_NUM {
+            inner.tasks[current].syscall_times[syscall_id] += 1;
+        }
+    }
+
+    /// change program brk of current task
+    fn change_current_program_brk(&self, size: i32) -> Option<usize> {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].change_program_brk(size)
+    }
+    
+    /// Get current task's memory set token
+    fn current_memory_set_token(&self) -> usize {
+        let inner = self.inner.exclusive_access();
+        inner.tasks[inner.current_task].memory_set.token()
+    }
+    
+    /// Translate virtual page number for current task
+    fn current_memory_set_translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
+        let inner = self.inner.exclusive_access();
+        inner.tasks[inner.current_task].memory_set.translate(vpn)
+    }
+    
+    /// Insert framed area to current task's memory set
+    fn current_memory_set_insert_framed_area(&self, start_va: VirtAddr, end_va: VirtAddr, permission: MapPermission) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].memory_set.insert_framed_area(start_va, end_va, permission);
+    }
+    
+    /// Unmap memory range for current task
+    fn current_memory_set_munmap(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> Result<(), ()> {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].memory_set.munmap(start_vpn, end_vpn)
     }
 }
 
@@ -188,17 +236,47 @@ pub fn exit_current_and_run_next() {
     run_next_task();
 }
 
-/// Get the current 'Running' task's token.
+/// Get the current user token
 pub fn current_user_token() -> usize {
     TASK_MANAGER.get_current_token()
 }
 
-/// Get the current 'Running' task's trap contexts.
-pub fn current_trap_cx() -> &'static mut TrapContext {
+/// Get the current trap context
+pub fn current_trap_cx() -> &'static mut crate::trap::TrapContext {
     TASK_MANAGER.get_current_trap_cx()
 }
 
-/// Change the current 'Running' task's program break
+/// Change program brk of current task
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Get the syscall times of current task
+pub fn get_current_syscall_times(syscall_id: usize) -> u32 {
+    TASK_MANAGER.get_current_syscall_times(syscall_id)
+}
+
+/// Increase the syscall times of current task
+pub fn increase_syscall_times(syscall_id: usize) {
+    TASK_MANAGER.increase_syscall_times(syscall_id);
+}
+
+/// Get current task's memory set token  
+pub fn current_memory_set_token() -> usize {
+    TASK_MANAGER.current_memory_set_token()
+}
+
+/// Translate virtual page number for current task
+pub fn current_memory_set_translate(vpn: VirtPageNum) -> Option<PageTableEntry> {
+    TASK_MANAGER.current_memory_set_translate(vpn)
+}
+
+/// Insert framed area to current task's memory set
+pub fn current_memory_set_insert_framed_area(start_va: VirtAddr, end_va: VirtAddr, permission: MapPermission) {
+    TASK_MANAGER.current_memory_set_insert_framed_area(start_va, end_va, permission);
+}
+
+/// Unmap memory range for current task
+pub fn current_memory_set_munmap(start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> Result<(), ()> {
+    TASK_MANAGER.current_memory_set_munmap(start_vpn, end_vpn)
 }

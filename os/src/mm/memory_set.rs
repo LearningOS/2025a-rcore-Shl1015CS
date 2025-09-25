@@ -58,10 +58,8 @@ impl MemorySet {
         end_va: VirtAddr,
         permission: MapPermission,
     ) {
-        self.push(
-            MapArea::new(start_va, end_va, MapType::Framed, permission),
-            None,
-        );
+        let area = MapArea::new(start_va, end_va, MapType::Framed, permission);
+        self.push(area, None);
     }
     fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>) {
         map_area.map(&mut self.page_table);
@@ -233,6 +231,11 @@ impl MemorySet {
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.page_table.translate(vpn)
     }
+    
+    /// Find page table entry by virtual page number
+    pub fn find_pte(&self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
+        self.page_table.find_pte(vpn)
+    }
     /// shrink the area to new_end
     #[allow(unused)]
     pub fn shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
@@ -261,6 +264,19 @@ impl MemorySet {
         } else {
             false
         }
+    }
+    
+    /// Remove memory mapping for specific VPN range
+    /// Returns Ok(()) if [start_vpn, end_vpn) matches exactly one MapArea
+    pub fn munmap(&mut self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> Result<(), ()> {
+        for (index, area) in self.areas.iter().enumerate() {
+            if area.vpn_range.get_start() == start_vpn && area.vpn_range.get_end() == end_vpn {
+                let mut area = self.areas.remove(index);
+                area.unmap(&mut self.page_table);
+                return Ok(());
+            }
+        }
+        Err(())
     }
 }
 /// map area structure, controls a contiguous piece of virtual memory
