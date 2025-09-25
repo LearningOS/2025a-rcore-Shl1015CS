@@ -60,6 +60,20 @@ impl MemorySet {
             None,
         );
     }
+    /// Remove mapped area that exactly matches [start_vpn, end_vpn) range
+    pub fn munmap(&mut self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> Result<(), ()> {
+        // Find the matching MapArea
+        for (idx, area) in self.areas.iter().enumerate() {
+            if area.vpn_range.get_start() == start_vpn && area.vpn_range.get_end() == end_vpn {
+                // Remove the area from list and unmap it
+                let mut area = self.areas.remove(idx);
+                area.unmap(&mut self.page_table);
+                return Ok(());
+            }
+        }
+        Err(())
+    }
+
     /// remove a area
     pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
         if let Some((idx, area)) = self
@@ -71,6 +85,11 @@ impl MemorySet {
             area.unmap(&mut self.page_table);
             self.areas.remove(idx);
         }
+    }
+
+    /// find page table entry by virtual page number
+    pub fn find_pte(&self, vpn: VirtPageNum) -> Option<&mut PageTableEntry> {
+        self.page_table.find_pte(vpn)
     }
     /// Add a new MapArea into this MemorySet.
     /// Assuming that there are no conflicts in the virtual address
