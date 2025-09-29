@@ -6,7 +6,7 @@ use core::fmt::{Debug, Formatter, Result};
 /// Magic number for sanity check
 const EFS_MAGIC: u32 = 0x3b800001;
 /// The max number of direct inodes
-const INODE_DIRECT_COUNT: usize = 28;
+const INODE_DIRECT_COUNT: usize = 28-1;
 /// The max length of inode name
 const NAME_LENGTH_LIMIT: usize = 27;
 /// The max number of indirect1 inodes
@@ -82,6 +82,7 @@ type DataBlock = [u8; BLOCK_SZ];
 #[repr(C)]
 pub struct DiskInode {
     pub size: u32,
+    pub link_count: u32,
     pub direct: [u32; INODE_DIRECT_COUNT],
     pub indirect1: u32,
     pub indirect2: u32,
@@ -89,11 +90,13 @@ pub struct DiskInode {
 }
 
 impl DiskInode {
-    /// Initialize a disk inode, as well as all direct inodes under it
+    /// Initialize a disk inode - optimized initialization
     /// indirect1 and indirect2 block are allocated only when they are needed
     pub fn initialize(&mut self, type_: DiskInodeType) {
         self.size = 0;
-        self.direct.iter_mut().for_each(|v| *v = 0);
+        self.link_count = 1;
+        // More efficient zero initialization
+        self.direct = [0u32; INODE_DIRECT_COUNT];
         self.indirect1 = 0;
         self.indirect2 = 0;
         self.type_ = type_;

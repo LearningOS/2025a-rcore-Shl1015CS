@@ -318,6 +318,52 @@ impl MemorySet {
             false
         }
     }
+    /// map - optimized interval overlap detection
+    pub fn map(
+        &mut self,
+        left: VirtPageNum,
+        right: VirtPageNum,
+        permission: MapPermission,
+    ) -> bool {
+        // Early validation
+        if left >= right {
+            return false;
+        }
+        
+        // Check for overlaps using optimized logic
+        // Two intervals [a,b) and [c,d) overlap if max(a,c) < min(b,d)
+        for map_area in self.areas.iter() {
+            let area_start = map_area.vpn_range.get_start();
+            let area_end = map_area.vpn_range.get_end();
+            
+            // Check if intervals overlap: !(left >= area_end || right <= area_start)
+            if left < area_end && right > area_start {
+                return false;  // Overlap detected
+            }
+        }
+        
+        self.insert_framed_area(left.into(), right.into(), permission);
+        true
+    }
+    /// unmap - optimized with early termination and better logic
+    pub fn unmap(&mut self, left: VirtPageNum, right: VirtPageNum) -> bool {
+        // Early validation
+        if left >= right {
+            return false;
+        }
+        
+        // Find and remove the area with exact match
+        if let Some(index) = self.areas.iter().position(|map_area| {
+            map_area.vpn_range.get_start() == left && map_area.vpn_range.get_end() == right
+        }) {
+            // Remove the area - this automatically calls unmap in the drop
+            let mut area = self.areas.remove(index);
+            area.unmap(&mut self.page_table);
+            true
+        } else {
+            false
+        }
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {

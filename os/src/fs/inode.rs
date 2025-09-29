@@ -4,7 +4,7 @@
 //!
 //! `UPSafeCell<OSInodeInner>` -> `OSInode`: for static `ROOT_INODE`,we
 //! need to wrap `OSInodeInner` into `UPSafeCell`
-use super::File;
+use super::{File, Stat, StatMode};
 use crate::drivers::BLOCK_DEVICE;
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
@@ -123,6 +123,42 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
             Arc::new(OSInode::new(readable, writable, inode))
         })
     }
+}
+
+/// Get file statistics - optimized to reduce function calls
+pub fn stat_file(path: &str) -> Option<Stat> {
+    let inode = ROOT_INODE.find(path)?;
+    let inode_id = inode.get_inode_id() as u64;
+    
+    let stat = inode.read_disk_inode(|diskinode| Stat {
+        dev: 0,
+        ino: inode_id,
+        mode: StatMode::FILE,
+        nlink: diskinode.link_count,
+        pad: Default::default(),
+    });
+    Some(stat)
+}
+
+/// Create a hard link for file - optimized pattern matching
+pub fn link_file(src_path: &str, new_path: &str) -> bool {
+    if let Some(old_inode) = ROOT_INODE.find(src_path) {
+        ROOT_INODE.create_link(old_inode, new_path);
+        true
+    } else {
+        false
+    }
+}
+
+/// Delete a hard link for file - optimized with cleaner logic
+pub fn unlink_file(name: &str) -> bool {
+    debug!("unlink_file: {}", name);
+    
+    ROOT_INODE.find(name).map_or(false, |inode| {
+        ROOT_INODE.delete(inode, name);
+        debug!("unlink_file: {} deleted", name);
+        true
+    })
 }
 
 impl File for OSInode {

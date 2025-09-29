@@ -3,13 +3,18 @@ use super::TaskContext;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
 use crate::config::TRAP_CONTEXT_BASE;
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
+use crate::mm::{MapPermission, MemorySet, PhysPageNum, VirtAddr, VirtPageNum, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
+use crate::timer::get_time_ms;
 use crate::trap::{trap_handler, TrapContext};
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
+
+/// const BIG_STRIDE for stride
+pub const BIG_STRIDE: usize = 255;
 
 /// Task control block structure
 ///
@@ -35,6 +40,10 @@ impl TaskControlBlock {
     pub fn get_user_token(&self) -> usize {
         let inner = self.inner_exclusive_access();
         inner.memory_set.token()
+    }
+    /// Get the stride of this task
+    pub fn get_stride(&self) -> usize {
+        self.inner_exclusive_access().stride
     }
 }
 
@@ -65,12 +74,22 @@ pub struct TaskControlBlockInner {
     /// It is set when active exit or execution error occurs
     pub exit_code: i32,
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
+    pub fd_name:Vec<Option<String>>,
 
     /// Heap bottom
     pub heap_bottom: usize,
 
     /// Program break
     pub program_brk: usize,
+
+    /// Start running time of task
+    pub start_time: usize,
+
+    /// Pass of task
+    pub pass: usize,
+
+    /// Stride of task
+    pub stride: usize,
 }
 
 impl TaskControlBlockInner {
@@ -86,13 +105,18 @@ impl TaskControlBlockInner {
     pub fn is_zombie(&self) -> bool {
         self.get_status() == TaskStatus::Zombie
     }
+    /// Allocate a file descriptor - optimized for better performance
     pub fn alloc_fd(&mut self) -> usize {
-        if let Some(fd) = (0..self.fd_table.len()).find(|fd| self.fd_table[*fd].is_none()) {
-            fd
-        } else {
-            self.fd_table.push(None);
-            self.fd_table.len() - 1
+        // Fast path: check if we can find a free slot quickly
+        for (i, slot) in self.fd_table.iter().enumerate() {
+            if slot.is_none() {
+                return i;
+            }
         }
+        // Slow path: extend the table
+        let new_fd = self.fd_table.len();
+        self.fd_table.push(None);
+        new_fd
     }
 }
 
@@ -133,8 +157,12 @@ impl TaskControlBlock {
                         // 2 -> stderr
                         Some(Arc::new(Stdout)),
                     ],
+                    fd_name:Vec::new(),
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    start_time: get_time_ms(),
+                    pass: BIG_STRIDE / 16,
+                    stride: 0,
                 })
             },
         };
@@ -214,8 +242,11 @@ impl TaskControlBlock {
                     children: Vec::new(),
                     exit_code: 0,
                     fd_table: new_fd_table,
+                    fd_name:parent_inner.fd_name.clone(),
                     heap_bottom: parent_inner.heap_bottom,
-                    program_brk: parent_inner.program_brk,
+                    program_brk: parent_inner.program_brk,start_time: get_time_ms(),
+                    pass: BIG_STRIDE / 16,
+                    stride: 0,
                 })
             },
         });
@@ -229,6 +260,21 @@ impl TaskControlBlock {
         task_control_block
         // **** release child PCB
         // ---- release parent PCB
+    }
+    /// parent process spawn the child process
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
+        // ---- access parent PCB exclusively
+        let mut parent_inner = self.inner_exclusive_access();
+
+        let child_tcb = Arc::new(TaskControlBlock::new(elf_data));
+        {
+            let mut child_inner = child_tcb.inner_exclusive_access();
+            child_inner.stride = parent_inner.stride;
+        }
+        // add child
+        parent_inner.children.push(child_tcb.clone());
+
+        child_tcb
     }
 
     /// get pid of process
@@ -260,6 +306,43 @@ impl TaskControlBlock {
         } else {
             None
         }
+    }
+    /// Map an area for current 'Running' task
+    pub fn map(&self, start: usize, len: usize, port: usize) -> bool {
+        let left_vaddr = VirtAddr::from(start);
+        let right_vaddr = VirtAddr::from(start + len);
+        if !left_vaddr.aligned() {
+            return false;
+        }
+        if port & !0x7 != 0 || port == 0 {
+            return false;
+        }
+
+        let left = VirtPageNum::from(left_vaddr);
+        let right = right_vaddr.ceil();
+        let permission = MapPermission::from_bits_truncate(((port as u8) << 1) | (1 << 4));
+
+        // get current task memset
+        let mut inner = self.inner.exclusive_access();
+        let memset = &mut inner.memory_set;
+
+        memset.map(left, right, permission)
+    }
+
+    /// Unmap an area for current 'Running' task
+    pub fn unmap(&self, start: usize, len: usize) -> bool {
+        let left_vaddr = VirtAddr::from(start);
+        let right_vaddr = VirtAddr::from(start + len);
+        if !left_vaddr.aligned() {
+            return false;
+        }
+        let left = VirtPageNum::from(left_vaddr);
+        let right = right_vaddr.ceil();
+        // get current task memset
+        let mut inner = self.inner.exclusive_access();
+        let memset = &mut inner.memory_set;
+
+        memset.unmap(left, right)
     }
 }
 

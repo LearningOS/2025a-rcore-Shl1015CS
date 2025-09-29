@@ -52,10 +52,12 @@ const SYSCALL_SPAWN: usize = 400;
 mod fs;
 mod process;
 
+use core::slice;
+
 use fs::*;
 use process::*;
 
-use crate::fs::Stat;
+use crate::{fs::Stat, mm::translated_byte_buffer, task::current_user_token};
 
 /// handle syscall exception with `syscall_id` and other arguments
 pub fn syscall(syscall_id: usize, args: [usize; 4]) -> isize {
@@ -80,5 +82,22 @@ pub fn syscall(syscall_id: usize, args: [usize; 4]) -> isize {
         SYSCALL_SPAWN => sys_spawn(args[0] as *const u8),
         SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize),
         _ => panic!("Unsupported syscall_id: {}", syscall_id),
+    }
+}
+
+/// copy memory to user space - optimized for better performance
+fn copy_to_user(kernel_start: usize, user_start: *const u8, len: usize) {
+    let token = current_user_token();
+    let slices = translated_byte_buffer(token, user_start, len);
+    
+    let mut kernel_ptr = kernel_start;
+    for slice in slices {
+        let slice_len = slice.len();
+        // SAFETY: kernel_ptr is guaranteed to be valid for slice_len bytes
+        let src_slice = unsafe {
+            slice::from_raw_parts(kernel_ptr as *const u8, slice_len)
+        };
+        slice.clone_from_slice(src_slice);
+        kernel_ptr += slice_len;
     }
 }
